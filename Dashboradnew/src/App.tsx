@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer,
 } from "recharts";
 
-// ✅ CHANGE THIS TO YOUR ESP32's IP ADDRESS
-const ESP32_IP = "10.31.122.231";
+const ESP32_IP = import.meta.env.VITE_ESP32_IP ?? "10.31.122.231";
+const SENSOR_SOURCE_URL = import.meta.env.VITE_SENSOR_SOURCE_URL ?? "";
+const PREDICTION_API_URL = import.meta.env.VITE_PREDICTION_API_URL ?? "";
+const POLL_INTERVAL_MS = Number(import.meta.env.VITE_POLL_INTERVAL_MS ?? 2000);
 
 const THRESHOLDS = {
   temp:     { warn: 35, danger: 40, max: 60 },
@@ -102,7 +104,156 @@ function RadialGauge({ value, max, color }: { value: number; max: number; color:
   );
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+type SensorSnapshot = {
+  temp: number;
+  humidity: number;
+  co: number;
+  aqi: number;
+};
+
+type PredictionResult = {
+  coPred: number;
+  hazardous: boolean;
+  source: "model" | "rule";
+};
+
+type SensorPoint = SensorSnapshot & {
+  time: string;
+};
+
+type ChartTooltipEntry = {
+  dataKey: string | number;
+  stroke: string;
+  name: string;
+  value: string | number;
+};
+
+type ChartTooltipProps = {
+  active?: boolean;
+  payload?: ChartTooltipEntry[];
+  label?: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseNumber(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return fallback;
+}
+
+function normalizeSensorPoint(payload: unknown): SensorSnapshot {
+  if (!isRecord(payload)) {
+    return { temp: 0, humidity: 0, co: 0, aqi: 0 };
+  }
+
+  return {
+    temp: parseNumber(payload.temperature ?? payload.temp),
+    humidity: parseNumber(payload.humidity ?? payload.hum),
+    co: parseNumber(payload.co ?? payload.carbonMonoxide ?? payload.carbon_monoxide),
+    aqi: parseNumber(payload.aqi ?? payload.airQualityIndex ?? payload.air_quality_index),
+  };
+}
+
+function extractLatestPayload(json: unknown): unknown {
+  if (Array.isArray(json)) {
+    return json.at(-1);
+  }
+
+  if (!isRecord(json)) {
+    return json;
+  }
+
+  if (Array.isArray(json.records)) {
+    return json.records.at(-1);
+  }
+
+  if (Array.isArray(json.data)) {
+    return json.data.at(-1);
+  }
+
+  if (isRecord(json.latest)) {
+    return json.latest;
+  }
+
+  return json;
+}
+
+async function fetchSensorReading(): Promise<SensorSnapshot> {
+  if (SENSOR_SOURCE_URL) {
+    const res = await fetch(SENSOR_SOURCE_URL, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      throw new Error(`S3/API source HTTP ${res.status}`);
+    }
+
+    const json: unknown = await res.json();
+    return normalizeSensorPoint(extractLatestPayload(json));
+  }
+
+  const res = await fetch(`http://${ESP32_IP}`, {
+    method: "GET",
+    mode: "cors",
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new Error(`ESP32 HTTP ${res.status}`);
+  }
+
+  const json: unknown = await res.json();
+  return normalizeSensorPoint(json);
+}
+
+async function fetchPrediction(point: SensorSnapshot): Promise<PredictionResult> {
+  if (PREDICTION_API_URL) {
+    try {
+      const res = await fetch(PREDICTION_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(point),
+      });
+
+      if (res.ok) {
+        const json: unknown = await res.json();
+
+        if (isRecord(json)) {
+          const coPred = parseNumber(
+            json.predicted_co ?? json.prediction ?? json.co_prediction ?? json.coPred ?? json.co,
+            point.co,
+          );
+
+          const hazardRaw = json.hazardous ?? json.is_hazardous ?? json.hazard;
+          const hazardous = typeof hazardRaw === "boolean" ? hazardRaw : coPred >= THRESHOLDS.co.warn;
+
+          return { coPred, hazardous, source: "model" };
+        }
+      }
+    } catch {
+      // Fall back to threshold rule if model endpoint is temporarily unreachable.
+    }
+  }
+
+  return {
+    coPred: point.co,
+    hazardous: point.co >= THRESHOLDS.co.warn,
+    source: "rule",
+  };
+}
+
+const CustomTooltip = ({ active, payload, label }: ChartTooltipProps) => {
   if (!active || !payload?.length) return null;
   return (
     <div style={{
@@ -114,7 +265,7 @@ const CustomTooltip = ({ active, payload, label }: any) => {
       minWidth: 140,
     }}>
       <p style={{ color: "#64748b", margin: "0 0 8px", fontSize: 11 }}>{label}</p>
-      {payload.map((p: any) => (
+      {payload.map((p) => (
         <div key={p.dataKey} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", background: p.stroke, flexShrink: 0 }} />
           <span style={{ color: "#94a3b8", flex: 1 }}>{p.name}</span>
@@ -127,8 +278,11 @@ const CustomTooltip = ({ active, payload, label }: any) => {
 
 export default function App() {
   const [connStatus, setConnStatus] = useState<"connecting" | "live" | "offline">("connecting");
-  const [data, setData]             = useState({ temp: 0, humidity: 0, co: 0, aqi: 0 });
-  const [history, setHistory]       = useState<any[]>([]);
+  const [data, setData]             = useState<SensorSnapshot>({ temp: 0, humidity: 0, co: 0, aqi: 0 });
+  const [history, setHistory]       = useState<SensorPoint[]>([]);
+  const [predictedCO, setPredictedCO] = useState(0);
+  const [hazardous, setHazardous]     = useState(false);
+  const [predictionSource, setPredictionSource] = useState<"model" | "rule">("rule");
   const [lastUpdated, setLastUpdated] = useState("—");
   const [uptime, setUptime]         = useState(0);
 
@@ -140,22 +294,17 @@ export default function App() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const res = await fetch(`http://${ESP32_IP}`, {
-          method: "GET",
-          mode: "cors",
-          headers: { Accept: "application/json" },
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json();
+        const reading = await fetchSensorReading();
         const point = {
           time:     new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-          temp:     json.temperature ?? 0,
-          humidity: json.humidity    ?? 0,
-          co:       json.co          ?? 0,
-          aqi:      json.aqi         ?? 0,
+          ...reading,
         };
-        setData(point);
+        setData({ temp: point.temp, humidity: point.humidity, co: point.co, aqi: point.aqi });
         setHistory(prev => [...prev.slice(-25), point]);
+        const prediction = await fetchPrediction(reading);
+        setPredictedCO(prediction.coPred);
+        setHazardous(prediction.hazardous);
+        setPredictionSource(prediction.source);
         setConnStatus("live");
         setLastUpdated(new Date().toLocaleTimeString());
       } catch {
@@ -167,14 +316,17 @@ export default function App() {
           co:       +(0.1 + Math.random() * 0.6).toFixed(2),
           aqi:      +(25 + Math.random() * 20).toFixed(0),
         };
-        setData(mock);
+        setData({ temp: mock.temp, humidity: mock.humidity, co: mock.co, aqi: mock.aqi });
         setHistory(prev => [...prev.slice(-25), mock]);
+        setPredictedCO(mock.co);
+        setHazardous(mock.co >= THRESHOLDS.co.warn);
+        setPredictionSource("rule");
         setLastUpdated(new Date().toLocaleTimeString());
       }
     };
 
     fetchData();
-    const iv = setInterval(fetchData, 2000);
+    const iv = setInterval(fetchData, POLL_INTERVAL_MS);
     return () => clearInterval(iv);
   }, []);
 
@@ -184,6 +336,9 @@ export default function App() {
   const dotColor =
     connStatus === "live"    ? "#10b981" :
     connStatus === "offline" ? "#f59e0b" : "#64748b";
+
+  const hazardColor = hazardous ? "#ef4444" : "#10b981";
+  const sourceLabel = SENSOR_SOURCE_URL ? "AWS S3 source" : `ESP32 @ ${ESP32_IP}`;
 
   return (
     <div style={{
@@ -272,7 +427,32 @@ export default function App() {
               borderRadius: 100, padding: "6px 14px", fontSize: 12,
               color: "#38bdf8", fontVariantNumeric: "tabular-nums",
             }}>
-              {ESP32_IP}
+              {sourceLabel}
+            </div>
+
+            {/* Predicted CO */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 6,
+              background: "#1a2540", border: "1px solid #263354",
+              borderRadius: 100, padding: "6px 14px", fontSize: 12,
+            }}>
+              <span style={{ color: "#64748b" }}>Pred CO</span>
+              <span style={{ color: "#f8fafc", fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+                {predictedCO.toFixed(2)} ppm
+              </span>
+            </div>
+
+            {/* Hazard */}
+            <div style={{
+              display: "flex", alignItems: "center", gap: 6,
+              background: `${hazardColor}1A`,
+              border: `1px solid ${hazardColor}66`,
+              borderRadius: 100, padding: "6px 14px", fontSize: 12,
+            }}>
+              <div style={{ width: 7, height: 7, borderRadius: "50%", background: hazardColor, boxShadow: `0 0 8px ${hazardColor}` }} />
+              <span style={{ color: hazardColor, fontWeight: 700 }}>
+                {hazardous ? "Hazardous" : "Safe"}
+              </span>
             </div>
           </div>
         </div>
@@ -385,7 +565,7 @@ export default function App() {
                 Live Sensor Trends
               </h3>
               <p style={{ margin: "3px 0 0", fontSize: 11, color: "#334155" }}>
-                Updated: {lastUpdated} · polling every 2s
+                Updated: {lastUpdated} · polling every {Math.round(POLL_INTERVAL_MS / 1000)}s
               </p>
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -441,7 +621,7 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 6, marginTop: 18 }}>
           <div style={{ width: 5, height: 5, borderRadius: "50%", background: dotColor, boxShadow: `0 0 6px ${dotColor}` }} />
           <span style={{ fontSize: 11, color: "#263354" }}>
-            ESP32 @ {ESP32_IP} · 2s polling · {connStatus === "offline" ? "showing mock data" : "live sensor data"}
+            {sourceLabel} · {Math.round(POLL_INTERVAL_MS / 1000)}s polling · prediction: {predictionSource === "model" ? "SageMaker model" : "threshold rule"} · {connStatus === "offline" ? "showing mock data" : "live sensor data"}
           </span>
         </div>
 
