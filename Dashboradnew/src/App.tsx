@@ -12,7 +12,7 @@ const POLL_INTERVAL_MS = Number(import.meta.env.VITE_POLL_INTERVAL_MS ?? 2000);
 const THRESHOLDS = {
   temp:     { warn: 35, danger: 40, max: 60 },
   humidity: { warn: 70, danger: 85, max: 100 },
-  co:       { warn: 9,  danger: 35, max: 50 },
+  co: { warn: 0.1, danger: 0.5, max: 1.0 },  // for low ppm values,
   aqi:      { warn: 100, danger: 200, max: 300 },
 };
 
